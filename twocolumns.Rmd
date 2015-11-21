@@ -1,0 +1,316 @@
+---
+title: "Practical Machine Learning Project"
+author: "Eugene"
+date: "18 November 2015"
+header-includes:
+   - \usepackage{multicol}
+output: html_document
+---
+
+```{r Libraries, echo=F, message=F, cache=F}
+library(caret)
+library(knitr)
+library(rJava)
+library(extraTrees)
+library(gplots)
+library(rpart)
+library(rattle)
+library(tree)
+library(gbm)
+library(klaR)
+library(MASS)
+library(graphics)
+library(data.table)
+library(gridExtra)
+```
+
+##Summary
+This report descibes the analysis of physiometric data to determine exercise performance. The input data is described [here](http://groupware.les.inf.puc-rio.br/har). In brief, a number of participants performed a set exercise either correctly (classe "A"), or else in one of a number of deliberately incorrect manners (classes "B":"E"). Physiometric measurements were taken during the exercise. The purpose of this analysis is to predict the classe of the exercise based on the physiometric data recorded.  
+To this end, the data is split into training and validation sets. A range of models are built on the training set. Their performances are assessed on the validation set. Then the best performing model is applied to an unseen test set. 
+
+
+##Results
+By far the best performing models in terms of out-of-sample accuracy were those based on Random Forests. Because of the way the data was treated, reducing the  number of variables, the analyses were of low bias and high variance so cross validation was essential to produce good predictors. A number of cross validation methods were tried; different numbers of folds up to leave-one-out, repeatedcv, boost632. Not all the results are given here. It was found that ten-fold cross validation is enough to produce good models without too big a penalty in computation time.
+
+##Data
+```{r Read_Data, echo=F, message=F, cache=T}
+seedvalue=2718
+set.seed(seedvalue)
+
+setwd("C:/Users/Eugene/Desktop/Coursera/08 Practical Machine Learning/Project")
+train.data = read.csv2("pml-training.csv", sep=",")
+test.data = read.csv2("pml-testing.csv", sep=",")
+
+#remove empty columns from test data
+test.data = test.data[,colSums(is.na(test.data))<nrow(test.data)]
+#remove problem_id column and initial boring columns from test data that just counts from 1:20
+test.data = test.data[,-c((1:7),60)]
+
+#give train data same columns as test data, but with classe column (160) added
+train.data = train.data[,c(which(names(train.data) %in% names(test.data)), 160)]
+
+#splitting into a training and validation sets
+intrain = createDataPartition(y=train.data$classe, p=0.7, list=F)
+training=train.data[intrain,]
+valid = train.data[-intrain,]
+```
+
+A seed is set at `r seedvalue ` for reproducibility. The data is read in from the following locations:  [training](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and [test](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv). The test data contains many columns that consist entirely of NA values, these are stripped from the dataset. It also contains several columns which are of no use for prediction: stuff like time, data, subject, and problem_id. These are also removed. The final data frame has `r length(test.data) ` columns.  
+The training data is cleaned so that it has the same columns as the test set, but with the extra column specifying the classe for each observation. The training set is then split into a training set proper and a validation set in a 70/30 ratio respectively.  
+The final data is checked to see if there are any NA values that should be imputed. That there are no NA values is found to be `r (sum(is.na(train.data))==0) `
+
+To investigate how easily the various classes of training behaviour might be separated we plotted sparklines (inspired a little bit by Edward Tufte's [Beautiful Evidence](http://www.edwardtufte.com/tufte/books_be) book. These sparklines are shown below, stack separated and ordered by mean of increasing parameter. The bottom red line represents classe A. As can be seen, parameters 45 (magnet_arm_y, orange vertical line) and 47 (magnet_arm_x, purple vertical line) seem particularly important to distinguish classe A from the rest. Many of the parameters show little variation from one set to the next and may be of little use as predictors. Overall, however, the variation between these sparklines leads me to be confident that good separation could be achieved. 
+
+```{r Sparklines, echo=F, message=F, cache=T, fig.height=5, fig.width=5, fig.align='center'}
+trainMean = training[,-53]
+trainMean = apply(trainMean, 2, as.numeric)
+trainMean = apply(trainMean, 2, mean)
+trainMean = as.data.frame(trainMean)
+trainMean = cbind(trainMean, row.names(trainMean))
+names(trainMean) = c("average", "activity")
+
+dt = as.data.table(training)
+dt2 <- dt[, lapply(.SD,mean), by=classe]
+dt2 = t(dt2)
+dt2 = as.data.frame(dt2)
+names(dt2) = c("A", "B", "C", "D", "E")
+dt2 = dt2[-1,]
+dt3 = apply(dt2, 2, as.numeric)
+dt3 = as.data.frame(dt3)
+dt3 = cbind(trainMean, dt3)
+dt3= arrange(dt3, average)
+
+dt3[,4] = dt3[,4]+200
+dt3[,5] = dt3[,5]+400
+dt3[,6] = dt3[,6]+600
+dt3[,7] = dt3[,7]+800
+
+ts.plot(dt3[,3:7],gpars= list(col=rainbow(5), xaxt='n', yaxt='n'), xlab="", ylab="", lwd=2)
+abline(v=45, col="orange")
+abline(v=47, col="purple")
+```
+
+##Processing Speed & Columns of Low Variablility
+Fitting predictive models can be computationally heavy and this is certainly true for the problem here with over fifty variables and thousands of measurements. For the most part this was pretty much beyond the meagre computing resources I had available. Also, in the spirit of the course it is more important to be able to try out different models than to have an industrial standard fit. To that end, the number of variables was reduced to manageable levels by selecting only those that showed significant variation across observations. After all, if a parameter doesn't change much then it doesn't greatly aide prediction. This selection procedure is done just once on the training set rather than for each stage of cross-validation, so it almost but doesn't quite meet the selection criterion set out by [Ambroise and McLachlan, 2002](https://www.uvm.edu/~rsingle/stat380/F04/possible/Ambroise+McLachlan-PNAS-2002.pdf).   
+
+```{r Reduce_Parameters, echo=F, message=F, cache=T}
+train.x = training[,-53]
+train.x = sapply(train.x, FUN=as.numeric)
+means = apply(train.x, MARGIN=2, FUN=mean)
+sds = apply(train.x, MARGIN=2, FUN=sd)
+train.xt = train.x[,(abs(sds/means)>1.5)]
+train.xt = as.data.frame(train.xt)
+train.xt = cbind(train.xt, training$classe)
+names(train.xt)[length(train.xt)] = "classe"
+valid1 = valid[c(which(names(valid) %in% names(train.xt)))]
+```
+
+The plot below shows the ratio of standard deviation to mean for all columns in the training data. A value of 1.5 was arbitrarily chosen to give a manageable number of variables for model fitting. This leaves `r (length(train.xt)-1) ` variables, the ones above the red line. It should be noted that, because of this, subsequent model fits are expected to have high bias and low variance.
+
+```{r Parameter_Plot,echo=F,message=F,cache=T,fig.height=3, fig.width=5, fig.align='center'}
+plot(abs(sds/means), , xlab="Paramter Index", ylab="")
+abline(h=1.5, col="red", lwd=2)
+```
+
+
+##Models
+###tree
+ 
+```{r Tree_Model, echo=F, message=F, cache=T}
+model.tree = tree(classe~., method = "class", data = train.xt)
+pred.tree = predict(model.tree, valid1, type = "class")
+cm.tree = confusionMatrix(valid1$classe, pred.tree)
+```
+
+To get some idea of how classification trees might work on this data we first ran the trees function. This simply uses [recursive partitioning](https://en.wikipedia.org/wiki/Recursive_partitioni) and is prone to overfitting of the data. For our validation data set it gave an out-of-sample accuracy of `r signif(cm.tree$overall[[1]], 2)`, so not so good. A plot of the tree produced is shown below:
+
+```{r Plot_ Tree_Model, echo=F, message=F, cache=T}
+plot(model.tree)
+text(model.tree, cex=0.75)
+```
+
+###Random Forest
+```{r RF_Model, echo=F, message=F, cache=T}
+modfit.rf10 = train(classe~.,data=train.xt, 
+               method="rf", 
+               trControl = trainControl(method = "cv", number = 10), 
+               allowParallel=T)
+pred.rf10 = predict(modfit.rf10, valid1)
+cm.rf10 = confusionMatrix(valid1$classe, pred.rf10)
+```
+A more sophisticated approach is to use a [Random Forest](https://en.wikipedia.org/wiki/Random_forest). This tackles the issue of overfitting. In this random forest, cross-validation was chosen with 10 splits. Leave-one-out cross validation was also tried but produced a negligible increase in accuracy and took a great deal longer to compute. The accuracy achieved was `r signif(cm.rf10$overall[[1]], 3)`, not bad. The full table is shown in Table 1.
+
+###Gradient Boosting
+
+```{r GBM_Model, echo=F, message=F, cache=T}
+library(caret)
+modfit.gbm = train(classe ~ ., data=train.xt, method = "gbm",
+                   trControl = trainControl(method="repeatedcv",number=5, repeats=1),
+                  verbose = FALSE)
+pred.gbm = predict(modfit.gbm, valid1)
+cm.gbm = confusionMatrix(valid1$classe, pred.gbm)
+```
+
+A Gradient Boosting model was applied to the problem. An interaction depth of 3 was chosen, close to the recommendation of [Hastie](https://web.stanford.edu/~hastie/local.ftp/Springer/OLD/ESLII_print4.pdf). 5-fold cross-validation was used. An accuracy of `r signif(cm.gbm$overall[[1]], 3)` was achieved.
+
+
+###Naieve Bayes
+```{r NB_Model,, echo=F, message=F, cache=T}
+#not sure why, but the nb trial runs fine in the console, but not in knitr. The code is shown below
+#modfit.nb = train(classe~.,data=train.xt, method="nb")
+#pred.nb = predict(modfit.nb, valid1)
+#write.csv2(x=pred.nb, file = "prednb.csv")
+pred.nb = read.csv2("prednb.csv", sep=";")
+pred.nb = as.factor(pred.nb$x)
+cm.nb = confusionMatrix(valid1$classe, pred.nb)
+```
+
+An accuracy of `r signif(cm.nb$overall[[1]], 3)` was achieved.
+
+###Linear Discriminant Analysis
+```{r LDA_Model,echo=F, message=F, cache=T}
+modfit.lda = train(classe ~ .,data=train.xt, method="lda", allowParallel=T)
+pred.lda = predict(modfit.lda, valid1)
+cm.lda = confusionMatrix(valid1$classe, pred.lda)
+```
+
+An accuracy of `r signif(cm.lda$overall[[1]], 3)` was achieved.
+
+
+###Extra Trees Model
+```{r XT_Model, echo=F, message=F, cache=T}
+training.x = sapply(training, FUN=as.numeric)
+valid.x = sapply(valid, as.numeric)
+modfit.XTrees= extraTrees(x=training.x[,-53], y = training[,53], na.action = "zero")
+pred.XTrees = predict(modfit.XTrees, valid.x[,-53])
+pred.XTrees_insample = predict(modfit.XTrees, training.x[,-53])
+cm.XTrees = confusionMatrix(valid1$classe, pred.XTrees)
+cm.XTrees_insample = confusionMatrix(training$classe, pred.XTrees_insample)
+
+```
+
+ExtraTrees is an extension of the random forest method. Instead of the chosing the best cutting threshold for the feature as random forest does, extraTrees choses the cut randomly. It uses the Gini Index to assess performance. It is also an order of magnitude faster than randomForest. We used the default settings: 500 trees and 1 random cut (increasing the number of random cuts is said to increase the accuracy. This model produced a mesmirising unerring fit to both the training set and the validation set. So the accuracy achieved was `r signif(cm.XTrees$overall[[1]], 3)`.
+
+##Comparing Models
+The table below gives the detection prevalence for different classes across the various models. As we can see, from a strictly accounting basis, ExtraTrees is extraordinary, Random Forest does OK, the rest get progressively worse
+
+```{r comparison,echo=F, message=F, cache=F,fig.height=3, fig.width=5, fig.align='center'}
+pred.table = rbind(summary(valid1$classe),
+                   summary(pred.XTrees),
+                   summary(pred.rf10),
+                   summary(pred.gbm),
+                   summary(pred.nb),
+                   summary(pred.lda),
+                   summary(pred.tree))
+
+pred.table = t(pred.table)
+pred.table = as.data.frame(pred.table)
+names(pred.table) = c("True Values", 
+                      "ExtraTrees", 
+                      "Random Forest",
+                      "Gradient Boosting",
+                      "Naive Bayes", 
+                      "LDA", 
+                      "tree")
+kable(pred.table)
+```
+
+This next table summarises the in-sample and out-of-sample accuracy of the various models. It also gives an indication of the compute time for each one. Unusally, the oos accuracy is better that the in-sample accuracy for some models, a quirk of the statistics I guess.
+
+```{r Accuracy Table, echo=F, message=F, cache=T,fig.height=3, fig.width=5, fig.align='center'}
+#note, some of these results were put in manually, couldn't quite get parts of to work in knitr
+XTrees = c(signif(cm.XTrees$overall[1], 3), 
+           signif(cm.XTrees$overall[1], 3), 
+           NA, "Limited Random Subset of Splits")
+rf10 = c(signif(max(modfit.rf10$results$Accuracy), 3),
+         signif(cm.rf10$overall[1], 3),
+         modfit.rf10$times$everything[3], "CV with 10 cuts")
+gbm3 = c(signif(max(modfit.gbm$results$Accuracy), 3),
+         signif(cm.gbm$overall[1], 3),
+         modfit.gbm$times$everything[3], "RepeatedCV")
+nb = c(signif(0.5204206, 3), 
+         signif(cm.nb$overall[1], 3),
+         68.9700000, "Default Cross-Validation")
+lda = c(signif(max(modfit.lda$results$Accuracy), 3), 
+         signif(cm.lda$overall[1], 3),
+         modfit.rf10$times$everything[3], "Default Cross-Validation")
+
+table.models = rbind(XTrees, rf10, gbm3, nb, lda)
+table.models = as.data.frame(table.models)
+names(table.models) = c("In Sample Accuracy", 
+                        "Out of Sample Accuracy", 
+                        "Time Taken", "Cross Validation Method")
+row.names(table.models) = c("Extra Trees", "Random Forest", "Gradient Boost", "Naive Bayes", "LDA")
+kable(table.models, table.attr = "width=\"100\"")
+```
+
+##Heat Maps
+Below is a series of heat maps from four of the models. It is hard to discern any particular pattern in these maps; the same combination of classes seem to pose difficult to all models. Classe A seems to be easy to identify. Classe B is frequently confused with other classes. 
+
+```{r Heat_Maps, echo=F, message=F, cache=T}
+table.rf10 = as.data.frame(cm.rf10$table)
+g.rf10 = ggplot(table.rf10, aes(as.factor(Prediction), Reference, group=Reference)) +
+  geom_tile(aes(fill = log(Freq+1))) + 
+  geom_text(aes(fill = log(table.rf10$Freq+1), label = round(table.rf10$Freq, 3))) +
+  scale_x_discrete("Prediction") + 
+  scale_fill_gradient(low = "white", high = "red", guide="none") + 
+  ggtitle("Random Forest") +
+  theme(plot.title=element_text(face="bold", size=10, colour="darkred"))
+table.XTree = as.data.frame(cm.XTrees$table)
+g.XTree = ggplot(table.XTree, aes(as.factor(Prediction), Reference, group=Reference)) +
+  geom_tile(aes(fill = log(Freq+1))) + 
+  geom_text(aes(fill = log(table.XTree$Freq+1), label = round(table.XTree$Freq, 3))) +
+  scale_x_discrete("Prediction") + 
+  scale_fill_gradient(low = "white", high = "red", guide="none") + 
+  ggtitle("ExtraTrees") +
+  theme(plot.title=element_text(face="bold", size=10, colour="darkred"))
+table.gbm = as.data.frame(cm.gbm$table)
+g.gbm = ggplot(table.gbm, aes(as.factor(Prediction), Reference, group=Reference)) +
+  geom_tile(aes(fill = log(Freq+1))) + 
+  geom_text(aes(fill = log(table.gbm$Freq+1), label = round(table.gbm$Freq, 3))) +
+  scale_x_discrete("Prediction") + 
+  scale_fill_gradient(low = "white", high = "red", guide="none") + 
+  ggtitle("Gradient Boost") +
+  theme(plot.title=element_text(face="bold", size=10, colour="darkred"))
+table.nb = as.data.frame(cm.nb$table)
+g.nb = ggplot(table.nb, aes(as.factor(Prediction), Reference, group=Reference)) +
+  geom_tile(aes(fill = log(Freq+1))) + 
+  geom_text(aes(fill = log(table.nb$Freq+1), label = round(table.nb$Freq, 3))) +
+  scale_x_discrete("Prediction") + 
+  scale_fill_gradient(low = "white", high = "red", guide="none") + 
+  ggtitle("Naive Bayes") +
+  theme(plot.title=element_text(face="bold", size=10, colour="darkred"))
+table.lda = as.data.frame(cm.lda$table)
+g.lda = ggplot(table.lda, aes(as.factor(Prediction), Reference, group=Reference)) +
+  geom_tile(aes(fill = log(Freq+1))) + 
+  geom_text(aes(fill = log(table.lda$Freq+1), label = round(table.lda$Freq, 3))) +
+  scale_x_discrete("Prediction") + 
+  scale_fill_gradient(low = "white", high = "red", guide="none") + 
+  ggtitle("LDA") +
+  theme(plot.title=element_text(face="bold", size=10, colour="darkred"))
+grid.arrange(g.rf10, g.XTree, g.gbm, g.nb, nrow=2, ncol=2)
+
+```
+
+##Confusion Matrices
+Just giving some examples of these:
+
+###Extra Trees
+
+```{r CM1, echo=F, message=F, cache=T}
+cm.XTrees
+```
+
+
+###Random Forest
+
+```{r CM2, echo=F, message=F, cache=T}
+cm.rf10
+```
+
+###Naive Bayes
+
+```{r CM3, echo=F, message=F, cache=T}
+cm.nb
+```
+
